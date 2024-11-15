@@ -1,14 +1,29 @@
 package fsft.fsftbuffer;
 
 import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class FSFTBuffer<B extends Bufferable> {
+
+    // Rep Invariant is
+    //      capacity > 0
+    //
 
     /* the default buffer size is 32 objects */
     public static final int DEFAULT_CAPACITY = 32;
 
     /* the default timeout value is 180 seconds */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(180);
+
+    private final int capacity;
+    private final Duration delta;
+    private final Map<B, Long> timeoutMap;
+    private final Map<String, B> idMap;
+    private final Queue<B> lastUseQueue;
+    private final long t0;
+    private final Thread parentThread; // thread where this instance was created
 
     /* TODO: Implement this datatype */
 
@@ -18,11 +33,26 @@ public class FSFTBuffer<B extends Bufferable> {
      * timeout period are removed from the cache.
      *
      * @param capacity the number of objects the buffer can hold
-     * @param timeout  the duration, in seconds, an object should
+     * @param delta  the duration, in seconds, an object should
      *                 be in the buffer before it times out
      */
-    public FSFTBuffer(int capacity, Duration timeout) {
-        // TODO: implement this constructor
+    public FSFTBuffer(int capacity, Duration delta) {
+        parentThread = Thread.currentThread();
+        t0 = System.currentTimeMillis();
+        this.capacity = capacity;
+        this.delta = delta;
+        idMap = new ConcurrentHashMap<>();
+        timeoutMap = new ConcurrentHashMap<>();
+        lastUseQueue = new ConcurrentLinkedQueue<>();
+        Thread refresher = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (parentThread.isAlive()) {
+                    refresh();
+                }
+            }
+        });
+        refresher.start();
     }
 
     /**
@@ -41,8 +71,39 @@ public class FSFTBuffer<B extends Bufferable> {
      * {@code b.id()}.
      */
     public boolean put(B b) {
-        // TODO: implement this method
-        return false;
+        if (b == null) {
+            throw new IllegalArgumentException("Object cannot be null");
+        }
+        if (touch(b.id())) {
+            return false;
+        }
+        if (lastUseQueue.size() >= capacity) {
+            removeLru();
+        }
+        timeoutMap.put(b, System.currentTimeMillis() + delta.toMillis());
+        lastUseQueue.add(b);
+        idMap.put(b.id(), b);
+        return true;
+    }
+
+    private void removeLru() {
+        B removedItem = lastUseQueue.remove();
+        idMap.remove(removedItem.id());
+        timeoutMap.remove(removedItem);
+    }
+
+    private void refresh() {
+        Iterator<Map.Entry<B, Long>> it = timeoutMap.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<B, Long> entry = it.next();
+            if (System.currentTimeMillis() > entry.getValue()) {
+                it.remove();
+                idMap.remove(entry.getKey().id());
+                lastUseQueue.remove(entry.getKey());
+                System.out.println("removed " + entry.getKey().id());
+                System.out.println("time: " + (System.currentTimeMillis() - t0) + " ms after buffer creation");
+            }
+        }
     }
 
     /**
@@ -51,12 +112,13 @@ public class FSFTBuffer<B extends Bufferable> {
      * buffer
      */
     public B get(String id) {
-        /* TODO: change this */
-        /* Do not return null. Throw a suitable checked exception when an object
-            is not in the cache. You can add the checked exception to the method
-            signature. You can change the method signature to include a throws
-            clause. */
-        return null;
+        if (!idMap.containsKey(id)) {
+            throw new NoSuchElementException("Buffer does not contain item with given id");
+        }
+        B item = idMap.get(id);
+        lastUseQueue.remove(item);
+        lastUseQueue.add(item);
+        return idMap.get(id);
     }
 
     /**
@@ -68,7 +130,25 @@ public class FSFTBuffer<B extends Bufferable> {
      * @return true if successful and false otherwise
      */
     public boolean touch(String id) {
-        /* TODO: Implement this method */
-        return false;
+        if (!idMap.containsKey(id)) {
+            return false;
+        }
+        B b = idMap.get(id);
+        timeoutMap.put(b, System.currentTimeMillis() + delta.toMillis());
+        return true;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        FSFTBuffer<SimpleBufferableItem> buff = new FSFTBuffer<>(4, Duration.ofSeconds(3));
+        SimpleBufferableItem i1 = new SimpleBufferableItem("i1");
+        SimpleBufferableItem i2 = new SimpleBufferableItem("i2");
+        SimpleBufferableItem i3 = new SimpleBufferableItem("i3");
+        SimpleBufferableItem i4 = new SimpleBufferableItem("i4");
+        buff.put(i1);
+        buff.put(i2);
+        Thread.sleep(3000);
+        buff.put(i3);
+        buff.put(i4);
+        Thread.sleep(10000);
     }
 }
