@@ -5,27 +5,68 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
+/**
+ * A finite-space, finite-time buffer of objects. Each object in the buffer is {@link Bufferable}
+ * (has a unique id). A buffer has a capacity, which is the number of objects it can hold
+ * at a time, and a timeout duration, which is the duration of time an object can remain
+ * in the buffer before it is considered "expired" and is removed. When the buffer is full,
+ * adding a new item evicts the LRU (least recently used) item from the buffer. Items are
+ * considered used if they are "gotten" by calling the {@code get} method. Items can be
+ * "refreshed" (increase their lifespan) by calling the {@code touch} method on them.
+ * Attempting to call {@code put} on an existing object in the buffer also refreshes its
+ * expiry time.
+ *
+ * <p>Main methods provided:</p>
+ * <ul>
+ *   <li>{@link #put(Bufferable)} puts a new object in the buffer</li>
+ *   <li>{@link #get(String)} gets the item in the buffer with the given id, effectively
+ *   "using" it</li>
+ *   <li>{@link #touch(String)} updates the expiry/timeout time of the object with the
+ *   given id to (current time) + {@link #delta}</li>
+ * </ul>
+ *
+ * <p>Notes:</p>
+ * <ul>
+ *     <li>{@code FSFTBuffer} is thread-safe. Instances of this class can be accessed by
+ *     multiple threads concurrently</li>
+ *     <li>When the buffer reaches its capacity and a new object is added, the buffer evicts
+ *     the least recently used (LRU) item</li>
+ *     <li>Buffer capacity and delta are fixed at creation and cannot be modified after</li>
+ * </ul>
+ *
+ * @param <B> the type of objects in the buffer; implements the {@link Bufferable} interface
+ * */
+
 public class FSFTBuffer<B extends Bufferable> {
+
+    // Abstraction Function:
+    //      AF(r) = A finite-space finite-time buffer where:
+    //      - r.capacity is the capacity of the buffer, specified during creation
+    //      - r.delta is the timeout duration, aka the amount of time an object can spend in
+    //      the buffer
+    //      - r.timeoutMap maps the items to their expiry times
+    //      - r.idMap maps the items' ids to the item itself
+    //      - r.lastUseQueue tracks the use frequency of items
 
     // Rep Invariant is
     //      capacity > 0
-    //
+    //      delta is not null and is a positive time duration
+    //      lastUseQueue, timeoutMap, and idMap are not null
+    //      lastUseQueue does not contain null values
+    //      timeoutMap and idMap do not contain null keys or values
+    //      lastUseQueue, timeoutMap.keySet(), and idMap.values() contain the same elements
 
     /* the default buffer size is 32 objects */
     public static final int DEFAULT_CAPACITY = 32;
-
     /* the default timeout value is 180 seconds */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(180);
 
+    private final Map<B, Long> timeoutMap = new ConcurrentHashMap<>();
+    private final Map<String, B> idMap = new ConcurrentHashMap<>();
+    private final Queue<B> lastUseQueue = new ConcurrentLinkedQueue<>();
+
     private final int capacity;
     private final Duration delta;
-    private final Map<B, Long> timeoutMap;
-    private final Map<String, B> idMap;
-    private final Queue<B> lastUseQueue;
-    private final long t0;
-    private final Thread parentThread; // thread where this instance was created
-
-    /* TODO: Implement this datatype */
 
     /**
      * Create a buffer with a fixed capacity and a timeout value.
@@ -37,22 +78,8 @@ public class FSFTBuffer<B extends Bufferable> {
      *                 be in the buffer before it times out
      */
     public FSFTBuffer(int capacity, Duration delta) {
-        parentThread = Thread.currentThread();
-        t0 = System.currentTimeMillis();
         this.capacity = capacity;
         this.delta = delta;
-        idMap = new ConcurrentHashMap<>();
-        timeoutMap = new ConcurrentHashMap<>();
-        lastUseQueue = new ConcurrentLinkedQueue<>();
-        Thread refresher = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                while (parentThread.isAlive()) {
-                    refresh();
-                }
-            }
-        });
-        refresher.start();
     }
 
     /**
@@ -74,35 +101,22 @@ public class FSFTBuffer<B extends Bufferable> {
         if (b == null) {
             throw new IllegalArgumentException("Object cannot be null");
         }
-        if (touch(b.id())) {
-            return false;
-        }
-        if (lastUseQueue.size() >= capacity) {
-            removeLru();
-        }
-        timeoutMap.put(b, System.currentTimeMillis() + delta.toMillis());
-        lastUseQueue.add(b);
-        idMap.put(b.id(), b);
-        return true;
-    }
-
-    private void removeLru() {
-        B removedItem = lastUseQueue.remove();
-        idMap.remove(removedItem.id());
-        timeoutMap.remove(removedItem);
-    }
-
-    private void refresh() {
-        Iterator<Map.Entry<B, Long>> it = timeoutMap.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<B, Long> entry = it.next();
-            if (System.currentTimeMillis() > entry.getValue()) {
-                it.remove();
-                idMap.remove(entry.getKey().id());
-                lastUseQueue.remove(entry.getKey());
-                System.out.println("removed " + entry.getKey().id());
-                System.out.println("time: " + (System.currentTimeMillis() - t0) + " ms after buffer creation");
+        synchronized (this) {
+            if (touch(b.id())) { // checks for existence and updates timeout if existing
+                System.out.println("attempted to add duplicate: " + b.id());
+                return false;
             }
+            if (lastUseQueue.size() >= capacity) {
+                System.out.println("BUFFER FULL");
+                if (!refresh()) {
+                    removeLRU();
+                }
+            }
+            timeoutMap.put(b, System.currentTimeMillis() + delta.toMillis());
+            lastUseQueue.add(b);
+            idMap.put(b.id(), b);
+            System.out.println("added item " + b.id() + " - " + lastUseQueue.size() + " items in buffer");
+            return true;
         }
     }
 
@@ -112,13 +126,38 @@ public class FSFTBuffer<B extends Bufferable> {
      * buffer
      */
     public B get(String id) {
+        if (id == null) {
+            throw new IllegalArgumentException("ID cannot be null");
+        }
         if (!idMap.containsKey(id)) {
             throw new NoSuchElementException("Buffer does not contain item with given id");
         }
-        B item = idMap.get(id);
-        lastUseQueue.remove(item);
-        lastUseQueue.add(item);
-        return idMap.get(id);
+        synchronized (this) {
+            B item = idMap.get(id);
+            if (isExpired(idMap.get(id))) {
+                throw new NoSuchElementException("Buffer does not contain item with given id");
+            }
+            lastUseQueue.remove(item);
+            lastUseQueue.add(item);
+        System.out.println("got item " + id);
+            return idMap.get(id);
+        }
+    }
+
+    /**
+     * Checks if the given item is expired, and removes it if it is.
+     *
+     * @param item to check the freshness of
+     * @return true if the item is expired and was removed, false otherwise
+     */
+    private boolean isExpired(B item) {
+        if (System.currentTimeMillis() > timeoutMap.get(item)) {
+            idMap.remove(item.id());
+            timeoutMap.remove(item);
+            lastUseQueue.remove(item);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -130,25 +169,61 @@ public class FSFTBuffer<B extends Bufferable> {
      * @return true if successful and false otherwise
      */
     public boolean touch(String id) {
-        if (!idMap.containsKey(id)) {
-            return false;
+        if (id == null) {
+            throw new IllegalArgumentException("ID cannot be null");
         }
-        B b = idMap.get(id);
-        timeoutMap.put(b, System.currentTimeMillis() + delta.toMillis());
-        return true;
+        synchronized (this) {
+            if (!idMap.containsKey(id)) {
+                return false;
+            }
+            B item = idMap.get(id);
+            if (isExpired(idMap.get(id))) {
+                return false;
+            }
+            timeoutMap.put(item, System.currentTimeMillis() + delta.toMillis());
+        System.out.println("touched " + id);
+            return true;
+        }
     }
 
-    public static void main(String[] args) throws InterruptedException {
-        FSFTBuffer<SimpleBufferableItem> buff = new FSFTBuffer<>(4, Duration.ofSeconds(3));
-        SimpleBufferableItem i1 = new SimpleBufferableItem("i1");
-        SimpleBufferableItem i2 = new SimpleBufferableItem("i2");
-        SimpleBufferableItem i3 = new SimpleBufferableItem("i3");
-        SimpleBufferableItem i4 = new SimpleBufferableItem("i4");
-        buff.put(i1);
-        buff.put(i2);
-        Thread.sleep(3000);
-        buff.put(i3);
-        buff.put(i4);
-        Thread.sleep(10000);
+    /**
+     * Removes the LRU (least recently used) object from the buffer
+     */
+    private void removeLRU() {
+        B removedItem = lastUseQueue.remove();
+        idMap.remove(removedItem.id());
+        timeoutMap.remove(removedItem);
+        System.out.println("removed LRU: " + removedItem.id());
+    }
+
+    /**
+     * Refreshes the buffer, removing all expired entries.
+     *
+     * @return true if items were removed, false otherwise
+     */
+    private boolean refresh() {
+        Iterator<Map.Entry<B, Long>> it = timeoutMap.entrySet().iterator();
+        boolean removed = false;
+        while (it.hasNext()) {
+            Map.Entry<B, Long> entry = it.next();
+            if (System.currentTimeMillis() > entry.getValue()) {
+                it.remove();
+                idMap.remove(entry.getKey().id());
+                lastUseQueue.remove(entry.getKey());
+                removed = true;
+                System.out.println("removed expired: " + entry.getKey().id());
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * @return a set of a all the items currently in the buffer
+     */
+    public Set<B> currentItems() {
+        synchronized (this) {
+            refresh();
+        }
+        return Collections.unmodifiableSet(timeoutMap.keySet());
     }
 }
